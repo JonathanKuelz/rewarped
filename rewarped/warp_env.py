@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from gym import spaces
+from gymnasium import spaces
 
 import warp as wp
 

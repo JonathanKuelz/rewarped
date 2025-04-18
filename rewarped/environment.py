@@ -100,7 +100,6 @@ def compute_up_vector(up_axis):
 class Environment:
     sim_name: str = "Environment"
 
-    frame_dt = 1.0 / 60.0
     episode_duration = 5.0  # seconds
 
     integrator_type: IntegratorType = IntegratorType.EULER

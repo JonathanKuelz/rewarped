@@ -1,6 +1,9 @@
+from typing import List, Sequence, Tuple
+
 import torch
 
 import warp as wp
+import warp.sim
 
 from .warp_utils import sim_update
 
@@ -32,17 +35,19 @@ def assign_adjoints(x, names, adj_tensors):
 
 
 class UpdateFunction(torch.autograd.Function):
+    """Performs a warp frame update. Implements checkpointing for memory-efficient backpropagation."""
+
     @staticmethod
     def forward(
         ctx,
-        update_params,
-        sim_params,
-        states,
-        control,
-        states_bwd,
-        control_bwd,
-        state_tensors_names,
-        control_tensors_names,
+        update_params: Tuple[wp.Tape, wp.sim.Integrator, wp.sim.Model, bool, bool],
+        sim_params: Tuple[int, float, bool, bool],
+        states: Tuple[wp.sim.State, List[wp.sim.State], wp.sim.State],
+        control: wp.sim.Control,
+        states_bwd: Tuple[wp.sim.State, List[wp.sim.State], wp.sim.State],
+        control_bwd: wp.sim.Control,
+        state_tensors_names: Sequence[str],
+        control_tensors_names: Sequence[str],
         *tensors,
     ):
         tape, integrator, model, use_graph_capture, synchronize = update_params
@@ -61,12 +66,7 @@ class UpdateFunction(torch.autograd.Function):
             tape = wp.Tape()
             update_params = (tape, *update_params[1:])
 
-        # for name in vars(model):
-        #     attr = getattr(model, name)
-        #     if isinstance(attr, wp.array):
-        #         # print(name)
-        #         attr.requires_grad = True
-
+        # Store everything in the context for backward pass
         ctx.update_params = update_params
         ctx.sim_params = sim_params
         ctx.states = states
@@ -101,6 +101,7 @@ class UpdateFunction(torch.autograd.Function):
                     finally:
                         integrator.bwd_update_graph = wp.capture_end()
 
+            # Checkpointing states and control
             assign_tensors(state_in, state_in_bwd, state_tensors_names, state_tensors)
             assign_tensors(control, control_bwd, control_tensors_names, control_tensors)
             wp.capture_launch(integrator.update_graph)
@@ -131,6 +132,7 @@ class UpdateFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *adj_tensors):
+        """Custom backward pass, making use of the checkpoints."""
         update_params = ctx.update_params
         sim_params = ctx.sim_params
         states = ctx.states
