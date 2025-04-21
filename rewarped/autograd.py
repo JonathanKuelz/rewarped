@@ -47,6 +47,7 @@ class UpdateFunction(torch.autograd.Function):
         states_bwd: Tuple[wp.sim.State, List[wp.sim.State], wp.sim.State],
         control_bwd: wp.sim.Control,
         state_tensors_names: Sequence[str],
+        model_tensors_names: Sequence[str],
         control_tensors_names: Sequence[str],
         *tensors,
     ):
@@ -56,7 +57,8 @@ class UpdateFunction(torch.autograd.Function):
         state_in_bwd, states_mid_bwd, state_out_bwd = states_bwd
 
         num_state = len(state_tensors_names)
-        state_tensors, control_tensors = tensors[:num_state], tensors[num_state:]
+        num_model = len(model_tensors_names)
+        state_tensors, model_tensors, control_tensors = tensors[:num_state], tensors[num_state:num_state + num_model], tensors[num_state + num_model:]
 
         if synchronize:
             # ensure Torch operations complete before running Warp
@@ -74,8 +76,10 @@ class UpdateFunction(torch.autograd.Function):
         ctx.states_bwd = states_bwd
         ctx.control_bwd = control_bwd
         ctx.state_tensors_names = state_tensors_names
+        ctx.model_tensors_names = model_tensors_names
         ctx.control_tensors_names = control_tensors_names
         ctx.state_tensors = state_tensors
+        ctx.model_tensors = model_tensors
         ctx.control_tensors = control_tensors
 
         if use_graph_capture:
@@ -101,9 +105,11 @@ class UpdateFunction(torch.autograd.Function):
                     finally:
                         integrator.bwd_update_graph = wp.capture_end()
 
-            # Checkpointing states and control
             assign_tensors(state_in, state_in_bwd, state_tensors_names, state_tensors)
             assign_tensors(control, control_bwd, control_tensors_names, control_tensors)
+            for name, tensor in zip(model_tensors_names, model_tensors):  # Minimal assign tensor to model
+                wp_array = getattr(model, name)
+                wp_array.assign(wp.from_torch(tensor, dtype=wp_array.dtype))
             wp.capture_launch(integrator.update_graph)
             assign_tensors(state_out_bwd, state_out, [], [])  # write to state_out
         else:
@@ -117,13 +123,16 @@ class UpdateFunction(torch.autograd.Function):
         outputs = []
         for name in state_tensors_names:
             out_tensor = wp.to_torch(getattr(state_out, name))
-            # assert not torch.isnan(out_tensor).any(), print("NaN fwd", name)
+            if use_graph_capture:
+                out_tensor = out_tensor.clone()
+            outputs.append(out_tensor)
+        for name in model_tensors_names:
+            out_tensor = wp.to_torch(getattr(model, name))
             if use_graph_capture:
                 out_tensor = out_tensor.clone()
             outputs.append(out_tensor)
         for name in control_tensors_names:
             out_tensor = wp.to_torch(getattr(control, name))
-            # assert not torch.isnan(out_tensor).any(), print("NaN fwd", name)
             if use_graph_capture:
                 out_tensor = out_tensor.clone()
             outputs.append(out_tensor)
@@ -140,8 +149,10 @@ class UpdateFunction(torch.autograd.Function):
         states_bwd = ctx.states_bwd
         control_bwd = ctx.control_bwd
         state_tensors_names = ctx.state_tensors_names
+        model_tensors_names = ctx.model_tensors_names
         control_tensors_names = ctx.control_tensors_names
         state_tensors = ctx.state_tensors
+        model_tensors = ctx.model_tensors
         control_tensors = ctx.control_tensors
 
         tape, integrator, model, use_graph_capture, synchronize = update_params
@@ -160,7 +171,8 @@ class UpdateFunction(torch.autograd.Function):
         adj_tensors = [adj_tensor.contiguous() for adj_tensor in adj_tensors]
 
         num_state = len(state_tensors_names)
-        adj_state_tensors, adj_control_tensors = adj_tensors[:num_state], adj_tensors[num_state:]
+        num_model = len(model_tensors_names)
+        adj_state_tensors, adj_model_tensors, adj_control_tensors = adj_tensors[:num_state], adj_tensors[num_state:num_state + num_model], adj_tensors[num_state + num_model:]
 
         if synchronize:
             # ensure Torch operations complete before running Warp
@@ -170,9 +182,13 @@ class UpdateFunction(torch.autograd.Function):
             # checkpointing method
             assign_tensors(state_in, state_in_bwd, state_tensors_names, state_tensors)
             assign_tensors(control, control_bwd, control_tensors_names, control_tensors)
+            for name, tensor in zip(model_tensors_names, model_tensors):  # Minimal assign tensor to model
+                wp_array = getattr(model, name)
+                wp_array.assign(wp.from_torch(tensor, dtype=wp_array.dtype))
             wp.capture_launch(integrator.update_graph)
 
             assign_adjoints(state_out_bwd, state_tensors_names, adj_state_tensors)
+            assign_adjoints(model, model_tensors_names, adj_model_tensors)
             assign_adjoints(control_bwd, control_tensors_names, adj_control_tensors)
             wp.capture_launch(integrator.bwd_update_graph)
             assert len(tape.gradients) > 0
@@ -201,9 +217,20 @@ class UpdateFunction(torch.autograd.Function):
                 if clip_grad is not None:
                     adj_tensor = torch.nan_to_num(adj_tensor, nan=0.0, posinf=-clip_grad, neginf=clip_grad)
                     adj_tensor = torch.clamp(adj_tensor, -clip_grad, clip_grad)
-
-                # print(name, adj_tensor.norm(), adj_tensor)
                 adj_inputs.append(adj_tensor)
+
+            for name in model_tensors_names:
+                grad = tape.gradients[getattr(model, name)]
+                adj_tensor = wp.to_torch(grad).clone()
+
+                if rescale_grad is not None:
+                    adj_tensor /= rescale_grad
+                if clip_grad is not None:
+                    adj_tensor = torch.nan_to_num(adj_tensor, nan=0.0, posinf=-clip_grad, neginf=clip_grad)
+                    adj_tensor = torch.clamp(adj_tensor, -clip_grad, clip_grad)
+
+                adj_inputs.append(adj_tensor)
+
             for name in control_tensors_names:
                 grad = tape.gradients[getattr(control, name)]
                 # adj_tensor = wp.to_torch(wp.clone(grad))
@@ -237,5 +264,6 @@ class UpdateFunction(torch.autograd.Function):
             None,  # states_bwd,
             None,  # control_bwd,
             None,  # state_tensors_names,
+            None,  # model_tensors_names,
             None,  # control_tensors_names,
         ) + tuple(adj_inputs)
