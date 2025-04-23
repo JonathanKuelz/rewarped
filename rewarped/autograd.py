@@ -58,7 +58,11 @@ class UpdateFunction(torch.autograd.Function):
 
         num_state = len(state_tensors_names)
         num_model = len(model_tensors_names)
-        state_tensors, model_tensors, control_tensors = tensors[:num_state], tensors[num_state:num_state + num_model], tensors[num_state + num_model:]
+        num_control = len(control_tensors_names)
+        state_tensors = tensors[:num_state]
+        model_tensors = tensors[num_state:num_state + num_model]
+        control_tensors = tensors[num_state + num_model:num_state + num_model + num_control]
+        mesh_tensors = tensors[num_state + num_model + num_control:]
 
         if synchronize:
             # ensure Torch operations complete before running Warp
@@ -81,6 +85,7 @@ class UpdateFunction(torch.autograd.Function):
         ctx.state_tensors = state_tensors
         ctx.model_tensors = model_tensors
         ctx.control_tensors = control_tensors
+        ctx.mesh_tensors = mesh_tensors
 
         if use_graph_capture:
             if getattr(integrator, "update_graph", None) is None:
@@ -110,6 +115,11 @@ class UpdateFunction(torch.autograd.Function):
             for name, tensor in zip(model_tensors_names, model_tensors):  # Minimal assign tensor to model
                 wp_array = getattr(model, name)
                 wp_array.assign(wp.from_torch(tensor, dtype=wp_array.dtype))
+            mesh_idx = 0
+            for geo in model.shape_geo_src:
+                if isinstance(geo, wp.sim.Mesh):
+                    geo.mesh.points.assign(wp.from_torch(mesh_tensors[mesh_idx], dtype=wp.vec3))
+                    mesh_idx += 1
             wp.capture_launch(integrator.update_graph)
             assign_tensors(state_out_bwd, state_out, [], [])  # write to state_out
         else:
@@ -137,6 +147,8 @@ class UpdateFunction(torch.autograd.Function):
                 out_tensor = out_tensor.clone()
             outputs.append(out_tensor)
 
+        outputs += list(t.clone() for t in mesh_tensors)
+
         return tuple(outputs)
 
     @staticmethod
@@ -154,6 +166,7 @@ class UpdateFunction(torch.autograd.Function):
         state_tensors = ctx.state_tensors
         model_tensors = ctx.model_tensors
         control_tensors = ctx.control_tensors
+        mesh_tensors = ctx.mesh_tensors
 
         tape, integrator, model, use_graph_capture, synchronize = update_params
         sim_substeps, sim_dt, kinematic_fk, eval_ik = sim_params
@@ -172,7 +185,11 @@ class UpdateFunction(torch.autograd.Function):
 
         num_state = len(state_tensors_names)
         num_model = len(model_tensors_names)
-        adj_state_tensors, adj_model_tensors, adj_control_tensors = adj_tensors[:num_state], adj_tensors[num_state:num_state + num_model], adj_tensors[num_state + num_model:]
+        num_control = len(control_tensors_names)
+        adj_state_tensors =  adj_tensors[:num_state]
+        adj_model_tensors = adj_tensors[num_state:num_state + num_model]
+        adj_control_tensors = adj_tensors[num_state + num_model:num_state + num_model + num_control]
+        adj_mesh_tensors = adj_tensors[num_state + num_model + num_control:]
 
         if synchronize:
             # ensure Torch operations complete before running Warp
@@ -185,11 +202,21 @@ class UpdateFunction(torch.autograd.Function):
             for name, tensor in zip(model_tensors_names, model_tensors):  # Minimal assign tensor to model
                 wp_array = getattr(model, name)
                 wp_array.assign(wp.from_torch(tensor, dtype=wp_array.dtype))
+            mesh_idx = 0
+            for geo in model.shape_geo_src:
+                if isinstance(geo, wp.sim.Mesh):
+                    geo.mesh.points.assign(wp.from_torch(mesh_tensors[mesh_idx], dtype=wp.vec3))
+                    mesh_idx += 1
             wp.capture_launch(integrator.update_graph)
 
             assign_adjoints(state_out_bwd, state_tensors_names, adj_state_tensors)
             assign_adjoints(model, model_tensors_names, adj_model_tensors)
             assign_adjoints(control_bwd, control_tensors_names, adj_control_tensors)
+            mesh_idx = 0
+            for geo in model.shape_geo_src:
+                if isinstance(geo, wp.sim.Mesh):
+                    geo.mesh.points.grad.assign(wp.from_torch(adj_mesh_tensors[mesh_idx], dtype=wp.vec3))
+                    mesh_idx += 1
             wp.capture_launch(integrator.bwd_update_graph)
             assert len(tape.gradients) > 0
         else:
@@ -244,6 +271,12 @@ class UpdateFunction(torch.autograd.Function):
 
                 # print(name, adj_tensor.norm(), adj_tensor)
                 adj_inputs.append(adj_tensor)
+
+            for geo in model.shape_geo_src:
+                if isinstance(geo, wp.sim.Mesh):
+                    adj_tensor = wp.to_torch(geo.mesh.points.grad).clone()
+                    adj_inputs.append(adj_tensor)
+
         except KeyError as e:
             print(f"Missing gradient for {name}")
             raise e
