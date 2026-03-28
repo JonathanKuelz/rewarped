@@ -18,8 +18,8 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "warp-lang",
-    "usd-core==24.5",
+    # warp-lang: installed separately from source (requires build_lib.py)
+    "usd-core>=24.5",
     "trimesh",
     "pycollada",
 ]
